@@ -34,8 +34,8 @@ class FluxMem:
     """
     _OFFSETS_3X3 = (
         (-1, -1), (-1, 0), (-1, 1),
-        (0, -1), (0, 0), (0, 1),
-        (1, -1), (1, 0), (1, 1),
+        (0, -1),  (0, 0),  (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
     )
     _OFFSETS_NEIGHBOR = (
         (-1, -1), (-1, 0), (-1, 1),
@@ -47,9 +47,9 @@ class FluxMem:
         self,
         vision_start_token_id: int,
         vision_end_token_id: int,
-        short_term_frames: int = 8,
-        mid_term_frames: int = 256,
-        direct_drop_sim_threshold: float = 0.8,
+        short_term_frames: int = 2,
+        mid_term_frames: int = 8,
+        direct_drop_sim_threshold: float = 0.999,
     ):
         """
         Initializes the FluxMem module.
@@ -131,11 +131,6 @@ class FluxMem:
         height_ids = height_ids.clone()
         width_ids = width_ids.clone()
         unique_times = torch.unique(time_ids[visual_indices])
-        print(f"""\n[DEBUG]: Shape = {unique_times.shape} and slice[:5]:
-              {unique_times[:5]}""")
-
-        # It should work for both Qwen2.5VL and Qwen3VL
-        print(f"\n[DEBUG]: unique_times length (1 means same indices for Qwen2.5) = {len(unique_times)}")
         for t in unique_times:
             frame_mask = (time_ids[visual_indices] == t)
             frame_indices = visual_indices[frame_mask]
@@ -242,7 +237,7 @@ class FluxMem:
         if values.numel() == 0:
             return None
 
-        v = values.detach().float().clamp(0.0, 2.0)
+        v = values.detach().float().clamp(0.0)
         if fallback_to_median and float(v.var().item()) <= 1e-12:
             return float(torch.median(v).item())
 
@@ -272,20 +267,9 @@ class FluxMem:
         time_ids: torch.Tensor,
         height_ids: torch.Tensor,
         width_ids: torch.Tensor,
-        grid_hw: tuple[int, int] | None,
     ) -> tuple[List[int], dict[int, torch.Tensor], dict[int, torch.Tensor]]:
         """
-        Organizes visual tokens into spatial grids per frame.
-
-        Args:
-            visual_indices (torch.Tensor): Indices of visual tokens.
-            time_ids (torch.Tensor): Temporal position IDs.
-            height_ids (torch.Tensor): Height position IDs.
-            width_ids (torch.Tensor): Width position IDs.
-            grid_hw (tuple): Expected grid height and width.
-
-        Returns:
-            tuple: (frame_ids_list, frame_to_indices_dict, frame_to_grid_dict)
+        Organizes visual tokens into spatial grids per frame with local sizes.
         """
         frame_ids = torch.unique(time_ids[visual_indices], sorted=True)
         frames = [int(frame_id) for frame_id in frame_ids.tolist()]
@@ -296,16 +280,23 @@ class FluxMem:
         for frame_id in frames:
             frame_indices = visual_indices[time_ids[visual_indices] == frame_id]
             frame_to_indices[frame_id] = frame_indices
-            if grid_hw is None:
+            
+            if frame_indices.numel() == 0:
                 continue
+
+            # Calculate local grid size for this specific frame
+            max_h = int(height_ids[frame_indices].max().item())
+            max_w = int(width_ids[frame_indices].max().item())
+            local_grid_hw = (max_h + 1, max_w + 1)
 
             frame_heights = height_ids[frame_indices].to(torch.long)
             frame_widths = width_ids[frame_indices].to(torch.long)
-            grid = torch.full(grid_hw, -1, dtype=torch.long, device=device)
-            if frame_indices.numel() > 0:
-                grid[frame_heights, frame_widths] = frame_indices
+            
+            # Use local grid size
+            grid = torch.full(local_grid_hw, -1, dtype=torch.long, device=device)
+            grid[frame_heights, frame_widths] = frame_indices
 
-            padded_grid = torch.full((grid_hw[0] + 2, grid_hw[1] + 2), -1, dtype=torch.long, device=device)
+            padded_grid = torch.full((local_grid_hw[0] + 2, local_grid_hw[1] + 2), -1, dtype=torch.long, device=device)
             padded_grid[1:-1, 1:-1] = grid
             frame_to_grid[frame_id] = padded_grid
 
@@ -346,26 +337,44 @@ class FluxMem:
         neighbor_heights = grid_heights.view(-1, 1) + offsets_3x3[:, 0].view(1, -1)
         neighbor_widths = grid_widths.view(-1, 1) + offsets_3x3[:, 1].view(1, -1)
 
-        neighbor_mats: List[torch.Tensor] = []
+        max_similarities = torch.full((query_indices.numel(),), float("-inf"), device=query_indices.device, dtype=hidden_norm.dtype)
+        has_any_neighbor = torch.zeros((query_indices.numel(),), dtype=torch.bool, device=query_indices.device)
+        
+        query_features = hidden_norm[query_indices].unsqueeze(1)
+
         for neighbor_frame in neighbor_frames:
-            neighbor_mats.append(frame_grids[neighbor_frame][neighbor_heights, neighbor_widths])
-        neighbor_mat = neighbor_mats[0] if len(neighbor_mats) == 1 else torch.cat(neighbor_mats, dim=1)
+            ref_grid = frame_grids[neighbor_frame]
+            h_max, w_max = ref_grid.shape
+            
+            # Bounds checking for different frame sizes
+            valid_coords = (neighbor_heights >= 0) & (neighbor_heights < h_max) & \
+                          (neighbor_widths >= 0) & (neighbor_widths < w_max)
+            
+            # Safe indexing
+            safe_h = neighbor_heights.clamp(0, h_max - 1)
+            safe_w = neighbor_widths.clamp(0, w_max - 1)
+            
+            ref_indices = ref_grid[safe_h, safe_w]
+            # Tokens are only valid if they are in-bounds and not empty (-1)
+            ref_indices = torch.where(valid_coords, ref_indices, -1)
+            
+            valid_neighbors = ref_indices >= 0
+            if not valid_neighbors.any():
+                continue
+                
+            has_any_neighbor |= valid_neighbors.any(dim=1)
+            
+            safe_ref_indices = ref_indices.clamp_min(0)
+            neighbor_features = hidden_norm[safe_ref_indices]
+            
+            similarities = (neighbor_features * query_features).sum(dim=2)
+            similarities = similarities.masked_fill(~valid_neighbors, float("-inf"))
+            
+            frame_max_sim = similarities.max(dim=1).values
+            max_similarities = torch.maximum(max_similarities, frame_max_sim)
 
-        valid_neighbors = neighbor_mat >= 0
-        has_neighbors = valid_neighbors.any(dim=1)
-
-        query_with_neighbors = query_indices[has_neighbors]
-        neighbor_mat = neighbor_mat[has_neighbors]
-        valid_neighbors = valid_neighbors[has_neighbors]
-
-        safe_indices = neighbor_mat.clamp_min(0)
-        neighbor_features = hidden_norm[safe_indices]
-        query_features = hidden_norm[query_with_neighbors].unsqueeze(1)
-        similarities = (neighbor_features * query_features).sum(dim=2)
-        similarities = similarities.masked_fill(~valid_neighbors, float("-inf"))
-        max_similarities = similarities.max(dim=1).values
         distances = 1.0 - max_similarities
-        return query_with_neighbors, max_similarities, distances, has_neighbors
+        return query_indices, max_similarities, distances, has_any_neighbor
 
     def _apply_adjacent_pruning(
         self,
@@ -414,6 +423,8 @@ class FluxMem:
 
         if has_next_neighbors.numel() != query_indices.numel():
             raise RuntimeError("Mismatch between query tokens and neighbor mask")
+        
+        # Keep tokens with no neighbors in the next frame
         if not bool(has_next_neighbors.all().item()):
             missing_neighbors = query_indices[~has_next_neighbors]
             if missing_neighbors.numel() > 0:
@@ -422,7 +433,7 @@ class FluxMem:
         if pair_distance_threshold is not None:
             next_threshold = float(max(0.0, min(2.0, float(pair_distance_threshold))))
         else:
-            next_threshold = self._otsu_threshold(next_distances, fallback_to_median=True)
+            next_threshold = self._otsu_threshold(next_distances[has_next_neighbors], fallback_to_median=True)
         
         if next_threshold is None:
             # If Otsu fails, keep all tokens to be safe
@@ -440,22 +451,20 @@ class FluxMem:
                 prev_threshold = self._otsu_threshold(prev_distances[valid_prev], fallback_to_median=True)
 
         if prev_threshold is not None:
-            prev_distances_on_next = pair_distance_cache[query_with_next]
-            keep_local = keep_by_next | (prev_distances_on_next >= prev_threshold)
+            keep_local = keep_by_next | (prev_distances >= prev_threshold)
         else:
             # If we don't have a valid previous threshold, we just rely on next_threshold or keep all
             if next_threshold is None:
-                 keep_local = torch.ones(query_with_next.numel(), dtype=torch.bool, device=query_with_next.device)
+                 keep_local = torch.ones(query_indices.numel(), dtype=torch.bool, device=query_indices.device)
             else:
                  keep_local = keep_by_next
 
-
-        if query_with_next.numel() > 0:
+        if query_indices.numel() > 0:
             drop_high_similarity = max_sim_next > self.direct_drop_sim_threshold
             if bool(drop_high_similarity.any().item()):
                 keep_local = keep_local & (~drop_high_similarity)
 
-        kept_indices = query_with_next[keep_local]
+        kept_indices = query_indices[keep_local]
         if kept_indices.numel() > 0:
             keep_mask[kept_indices] = True
 
@@ -511,17 +520,15 @@ class FluxMem:
 
             drop_vis_path = self.drop_vis_path
 
-            time_ids = position_ids[0, batch_index]
-            height_ids = position_ids[1, batch_index].to(torch.long)
-            width_ids = position_ids[2, batch_index].to(torch.long)
+            time_ids = position_ids[-3, batch_index]
+            height_ids = position_ids[-2, batch_index].to(torch.long)
+            width_ids = position_ids[-1, batch_index].to(torch.long)
             height_ids, width_ids = self._localize_spatial_ids(visual_indices, time_ids, height_ids, width_ids)
-            grid_hw = self._compute_grid_hw(visual_indices, height_ids, width_ids)
             frames, frame_to_indices, frame_grids = self._frame_grids(
                 visual_indices=visual_indices,
                 time_ids=time_ids,
                 height_ids=height_ids,
                 width_ids=width_ids,
-                grid_hw=grid_hw,
             )
             if len(frames) == 0:
                 raise RuntimeError("No visual frames extracted")
@@ -531,6 +538,7 @@ class FluxMem:
             non_visual_mask[visual_indices] = False
             keep_mask[non_visual_mask] = True
 
+            # Use normalized hidden states for distance calculation
             hidden_norm = F.normalize(hidden_states[batch_index], p=2, dim=1, eps=1e-8)
             pair_distance_cache = torch.full((sequence_length,), -1.0, dtype=hidden_states.dtype, device=device)
             short_term_buffer: List[int] = []
@@ -573,7 +581,7 @@ class FluxMem:
                     mid_term_frames.append(evicted_frame)
                     if len(mid_term_frames) > max(0, mid_term_limit):
                         oldest_mid_frame = mid_term_frames.pop(0)
-                        self._long_term_memory_merge_per_frames(
+                        self._apply_long_term_merging(
                             batch_index=batch_index,
                             long_frames={oldest_mid_frame},
                             visual_indices=visual_indices,
@@ -583,8 +591,13 @@ class FluxMem:
                             hidden_states=hidden_states,
                             hidden_norm=hidden_norm,
                             keep_mask=keep_mask,
-                            grid_hw=grid_hw,
                         )
+                    
+                    # Memory Cleanup: Remove spatial grid and indices of processed frame
+                    if evicted_frame in frame_grids:
+                        del frame_grids[evicted_frame]
+                    if evicted_frame in frame_to_indices:
+                        del frame_to_indices[evicted_frame]
 
             for frame_id in short_term_buffer:
                 keep_mask[frame_to_indices[frame_id]] = True
@@ -598,7 +611,7 @@ class FluxMem:
                         height_ids=height_ids,
                         width_ids=width_ids,
                         keep_mask=keep_mask,
-                        grid_hw=grid_hw,
+                        grid_hw=None, # grid_hw is now per-frame, passing None for global log
                     ):
                         f_out.write(json.dumps(rec) + "\n")
 
@@ -631,7 +644,7 @@ class FluxMem:
         )
         return hidden_states_out, position_embeddings_out, position_ids_out, attention_mask_out, kept_indices_list
 
-    def _long_term_memory_merge_per_frames(
+    def _apply_long_term_merging(
         self,
         batch_index: int,
         long_frames: set[int],
@@ -686,9 +699,10 @@ class FluxMem:
                 continue
 
             if grid_hw is None:
-                local_grid_hw = self._compute_grid_hw(kept_frame_indices, frame_heights, frame_widths)
-                if local_grid_hw is None:
-                    continue
+                # Use local coordinate range to compute grid size
+                max_h = int(frame_heights.max().item())
+                max_w = int(frame_widths.max().item())
+                local_grid_hw = (max_h + 1, max_w + 1)
             else:
                 local_grid_hw = grid_hw
 
@@ -720,7 +734,7 @@ class FluxMem:
                 features_norm = F.normalize(hidden_states[batch_index, kept_frame_indices].float(), p=2, dim=1, eps=1e-8)
 
             edge_distances = 1.0 - (features_norm[edge_i] * features_norm[edge_j]).sum(dim=1)
-            edge_distances = edge_distances.clamp(0.0, 2.0)
+            edge_distances = edge_distances.clamp(0.0)
             threshold = self._otsu_threshold(edge_distances)
             if threshold is None:
                 continue
