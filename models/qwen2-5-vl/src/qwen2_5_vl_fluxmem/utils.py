@@ -73,8 +73,16 @@ def right_pad_and_stack(
 
     hidden_states = torch.stack(batch_hidden, dim=0)
     position_ids = torch.stack(batch_pos_ids, dim=0).transpose(0, 1)
-    pos_e1_b = torch.stack(batch_pos_e1, dim=0).transpose(0, 1)
-    pos_e2_b = torch.stack(batch_pos_e2, dim=0).transpose(0, 1)
+
+    # TEMPORARY COMMENT
+    pos_e1_b = torch.stack(batch_pos_e1, dim=0)
+    if pos_e1_b.ndim == 4:
+        pos_e1_b = pos_e1_b.transpose(0, 1)
+
+    pos_e2_b = torch.stack(batch_pos_e2, dim=0)
+    if pos_e2_b.ndim == 4:
+        pos_e2_b = pos_e2_b.transpose(0, 1)
+
     attention_mask = torch.stack(batch_attn, dim=0)
 
     return hidden_states, (pos_e1_b, pos_e2_b), position_ids, attention_mask

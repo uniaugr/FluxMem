@@ -163,11 +163,14 @@ class FluxMem:
         Returns:
             dict: Dictionary containing the kept features and positions.
         """
+        p_emb1 = position_embeddings[0]
+        p_emb2 = position_embeddings[1]
+        # TEMPORARY COMMENT
         return {
             "hidden": hidden_states[batch_index, kept_indices],
             "pos_ids": position_ids[:, batch_index, kept_indices],
-            "pos_emb1": position_embeddings[0][:, batch_index, kept_indices],
-            "pos_emb2": position_embeddings[1][:, batch_index, kept_indices],
+            "pos_emb1": p_emb1[:, batch_index, kept_indices] if p_emb1.ndim == 4 else p_emb1[batch_index, kept_indices],
+            "pos_emb2": p_emb2[:, batch_index, kept_indices] if p_emb2.ndim == 4 else p_emb2[batch_index, kept_indices],
         }
 
     @staticmethod
